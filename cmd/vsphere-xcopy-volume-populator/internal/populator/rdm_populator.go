@@ -22,7 +22,7 @@ func NewRDMPopulator(storageApi RDMCapable, vmwareClient vmware.Client) (Populat
 }
 
 // Populate performs the RDM copy operation
-func (p *RDMPopulator) Populate(vmId string, sourceVMDKFile string, pv PersistentVolume, hostLocker Hostlocker, progress chan<- uint64, xcopyUsed chan<- int, quit chan error) (errFinal error) {
+func (p *RDMPopulator) Populate(vmId string, sourceVMDKFile string, pv PersistentVolume, migrationMetadata *MigrationMetadata, hostLocker Hostlocker, progress chan<- uint64, xcopyUsed chan<- int, quit chan error) (errFinal error) {
 	defer func() {
 		r := recover()
 		if r != nil {
@@ -38,7 +38,14 @@ func (p *RDMPopulator) Populate(vmId string, sourceVMDKFile string, pv Persisten
 	// RDM copy does not use xcopy
 	xcopyUsed <- 0
 
+	// Store migration metadata in PV volume attributes ONLY if storage supports tagging
+	// This avoids unnecessary work for storage vendors that don't support volume tagging
+	if _, supportsTagging := p.storageApi.(VolumeTaggingSupport); supportsTagging {
+		StoreMigrationMetadata(&pv, migrationMetadata)
+	}
+
 	// Perform the RDM copy operation
+	// Note: Volume tagging is handled inside RDMCopy() by storage implementations that support it
 	klog.Infof("RDM Populator: Starting RDM copy operation...")
 	err := p.storageApi.RDMCopy(p.vSphereClient, vmId, sourceVMDKFile, pv, progress)
 	if err != nil {

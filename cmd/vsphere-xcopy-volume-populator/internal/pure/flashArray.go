@@ -20,6 +20,21 @@ import (
 
 const FlashProviderID = "624a9370"
 
+// Volume tagging constants for Forklift migrations
+const (
+	TagNamespace          = "openshift-forklift"
+	TagKeyMigrationMethod = "migrationMethod"
+	TagKeySourceProvider  = "sourceProvider"
+	TagKeyTargetProvider  = "targetProvider"
+	TagKeyMigrationType   = "migrationType"
+
+	// Default values for vsphere-xcopy-volume-populator
+	DefaultSourceProvider  = "vmware"
+	DefaultTargetProvider  = "forklift"
+	DefaultMigrationType   = "cold"
+	DefaultMigrationMethod = "xcopy"
+)
+
 // Ensure FlashArrayClonner implements required interfaces
 var _ populator.RDMCapable = &FlashArrayClonner{}
 var _ populator.VVolCapable = &FlashArrayClonner{}
@@ -99,6 +114,7 @@ func (f *FlashArrayClonner) EnsureClonnerIgroup(initiatorGroup string, esxAdapte
 }
 
 // Map is responsible to mapping an initiator group to a populator.LUN
+// It also tags the volume with migration metadata if present in the context
 func (f *FlashArrayClonner) Map(
 	initatorGroup string,
 	targetLUN populator.LUN,
@@ -121,9 +137,78 @@ func (f *FlashArrayClonner) Map(
 			return populator.LUN{}, fmt.Errorf("connect host %q to volume %q: %w", host, targetLUN.Name, err)
 		}
 
+		// Tag volume with migration metadata if present in context
+		// This is called after mapping for xcopy method (consistent with RDM/VVol tagging)
+		if err := f.TagVolume(targetLUN.Name, context); err != nil {
+			klog.Warningf("Failed to tag volume %s with migration metadata (non-fatal): %v", targetLUN.Name, err)
+		}
+
 		return targetLUN, nil
 	}
 	return populator.LUN{}, fmt.Errorf("connection failed for all hosts in context")
+}
+
+// createForkliftTag creates a volume tag in the Forklift namespace
+func createForkliftTag(key, value string) VolumeTag {
+	return VolumeTag{
+		Key:       key,
+		Value:     value,
+		Namespace: TagNamespace,
+		Copyable:  false,
+	}
+}
+
+// getStringFromContext extracts a string value from MappingContext with a default fallback
+func getStringFromContext(context populator.MappingContext, key, defaultValue string) string {
+	if val, ok := context[key].(string); ok && val != "" {
+		return val
+	}
+	return defaultValue
+}
+
+// TagVolume tags a FlashArray volume with xcopy migration metadata
+// This implements the VolumeTaggingSupport interface
+func (f *FlashArrayClonner) TagVolume(volumeName string, context populator.MappingContext) error {
+	if f.restClient == nil {
+		return fmt.Errorf("REST client not initialized")
+	}
+
+	// Extract migration metadata from context with defaults
+	sourceProvider := getStringFromContext(context, "sourceProvider", DefaultSourceProvider)
+	migrationType := getStringFromContext(context, "migrationType", DefaultMigrationType)
+	migrationMethod := getStringFromContext(context, "migrationMethod", DefaultMigrationMethod)
+
+	// Build tags array for batch endpoint
+	tags := []VolumeTag{
+		createForkliftTag(TagKeyMigrationMethod, migrationMethod),
+		createForkliftTag(TagKeySourceProvider, sourceProvider),
+		createForkliftTag(TagKeyTargetProvider, DefaultTargetProvider),
+		createForkliftTag(TagKeyMigrationType, migrationType),
+	}
+
+	klog.Infof("Tagging FlashArray volume %s with migration metadata: source=%s, target=%s, type=%s, method=%s",
+		volumeName, sourceProvider, DefaultTargetProvider, migrationType, migrationMethod)
+	return f.restClient.SetVolumeTagsBatch(volumeName, tags)
+}
+
+// tagVolumeWithMigrationMetadata is a helper to tag volumes from VvolCopy/RDMCopy methods
+// It extracts metadata from PV volume attributes and calls TagVolume
+func (f *FlashArrayClonner) tagVolumeWithMigrationMetadata(volumeName, migrationMethod string, volumeAttributes map[string]string) error {
+	// Build mapping context from volume attributes
+	mappingContext := make(populator.MappingContext)
+
+	// Extract migration metadata from volume attributes if present
+	if sourceProvider, ok := volumeAttributes["migration.forklift.konveyor.io/source-provider"]; ok {
+		mappingContext["sourceProvider"] = sourceProvider
+	}
+	if migrationType, ok := volumeAttributes["migration.forklift.konveyor.io/migration-type"]; ok {
+		mappingContext["migrationType"] = migrationType
+	}
+
+	// Set the migration method (vvol, rdm, or xcopy)
+	mappingContext["migrationMethod"] = migrationMethod
+
+	return f.TagVolume(volumeName, mappingContext)
 }
 
 // UnMap is responsible to unmapping an initiator group from a populator.LUN
@@ -212,6 +297,13 @@ func (f *FlashArrayClonner) VvolCopy(vsphereClient vmware.Client, vmId string, s
 	}
 
 	klog.Infof("VVol copy operation completed successfully")
+
+	// Tag the target volume with migration metadata
+	// Note: We tag here (not in VvolPopulator) because we know the actual Pure volume name
+	if err := f.tagVolumeWithMigrationMetadata(targetLUN.Name, "vvol", persistentVolume.VolumeAttributes); err != nil {
+		klog.Warningf("Failed to tag volume %s with migration metadata (non-fatal): %v", targetLUN.Name, err)
+	}
+
 	return nil
 }
 
@@ -312,6 +404,13 @@ func (f *FlashArrayClonner) RDMCopy(vsphereClient vmware.Client, vmId string, so
 	progress <- 100
 
 	klog.Infof("Pure RDM Copy: Copy operation completed successfully")
+
+	// Tag the target volume with migration metadata
+	// Note: We tag here (not in RDMPopulator) because we know the actual Pure volume name
+	if err := f.tagVolumeWithMigrationMetadata(targetLUN.Name, "rdm", persistentVolume.VolumeAttributes); err != nil {
+		klog.Warningf("Failed to tag volume %s with migration metadata (non-fatal): %v", targetLUN.Name, err)
+	}
+
 	return nil
 }
 

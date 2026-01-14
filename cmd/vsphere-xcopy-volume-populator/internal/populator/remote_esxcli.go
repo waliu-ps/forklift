@@ -79,7 +79,7 @@ func NewWithRemoteEsxcliSSH(storageApi VMDKCapable, vmwareClient vmware.Client, 
 	}, nil
 }
 
-func (p *RemoteEsxcliPopulator) Populate(vmId string, sourceVMDKFile string, pv PersistentVolume, hostLocker Hostlocker, progress chan<- uint64, xcopyUsed chan<- int, quit chan error) (errFinal error) {
+func (p *RemoteEsxcliPopulator) Populate(vmId string, sourceVMDKFile string, pv PersistentVolume, migrationMetadata *MigrationMetadata, hostLocker Hostlocker, progress chan<- uint64, xcopyUsed chan<- int, quit chan error) (errFinal error) {
 	// isn't it better to not call close the channel from the caller?
 	defer func() {
 		r := recover()
@@ -236,6 +236,24 @@ func (p *RemoteEsxcliPopulator) Populate(vmId string, sourceVMDKFile string, pv 
 		}
 	}
 
+	// Add migration metadata to mapping context ONLY if storage supports tagging
+	// This avoids unnecessary work for storage vendors that don't support volume tagging
+	if _, supportsTagging := p.StorageApi.(VolumeTaggingSupport); supportsTagging {
+		if mappingContext == nil {
+			mappingContext = make(MappingContext)
+		}
+
+		if migrationMetadata != nil {
+			mappingContext["sourceProvider"] = migrationMetadata.SourceProvider
+			mappingContext["migrationType"] = migrationMetadata.MigrationType
+		}
+		// Set migration method to xcopy for this populator
+		mappingContext["migrationMethod"] = "xcopy"
+	} else if mappingContext == nil {
+		// Still need to initialize mappingContext for other uses (e.g., PowerFlex SDC mapping)
+		mappingContext = make(MappingContext)
+	}
+
 	fullCleanUpAttempted := false
 
 	defer func() {
@@ -258,6 +276,8 @@ func (p *RemoteEsxcliPopulator) Populate(vmId string, sourceVMDKFile string, pv 
 		}
 	}()
 
+	// Map the LUN to the initiator group
+	// Note: Volume tagging is handled inside Map() by storage implementations that support it (e.g., Pure Storage)
 	lun, err = p.StorageApi.Map(xcopyInitiatorGroup, lun, mappingContext)
 	if err != nil {
 		return fmt.Errorf("failed to map lun %s to initiator group %s: %w", lun, xcopyInitiatorGroup, err)

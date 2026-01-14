@@ -62,6 +62,14 @@ type VolumeTagsResponse struct {
 	TotalItemCount     *int            `json:"total_item_count"`
 }
 
+// VolumeTag represents a tag to be applied to a volume
+type VolumeTag struct {
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	Copyable  bool   `json:"copyable"`
+}
+
 // CopyVolumeRequest represents the request for copying a volume
 type CopyVolumeRequest struct {
 	Source struct {
@@ -670,4 +678,46 @@ func compareVersions(v1, v2 string) int {
 	}
 
 	return 0
+}
+
+// SetVolumeTagsBatch sets multiple tags on a volume using the batch tags API
+// This uses the PUT /api/2.x/volumes/tags/batch endpoint
+func (c *RestClient) SetVolumeTagsBatch(volumeName string, tags []VolumeTag) error {
+	q := url.Values{}
+	q.Set("resource_names", volumeName)
+
+	url := fmt.Sprintf("https://%s/api/%s/volumes/tags/batch?%s", c.hostname, c.apiV2, q.Encode())
+
+	jsonData, err := json.Marshal(tags)
+	if err != nil {
+		return fmt.Errorf("failed to marshal tag request: %w", err)
+	}
+
+	klog.V(2).Infof("Pure REST Client: Setting tags on volume %s: %s", volumeName, string(jsonData))
+
+	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create tag request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-auth-token", c.authToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send tag request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read tag response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("tag request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	klog.Infof("Pure REST Client: Successfully tagged volume %s with %d tags", volumeName, len(tags))
+	return nil
 }

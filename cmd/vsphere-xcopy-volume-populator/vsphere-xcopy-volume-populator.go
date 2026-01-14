@@ -12,7 +12,9 @@ import (
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/cert"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator/internal/flashsystem"
 	"github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator/internal/infinibox"
@@ -31,6 +33,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -186,6 +189,37 @@ func main() {
 		klog.Fatalf("Failed to fetch the volume handle details from the target pvc %s: %s", ownerName, err)
 	}
 
+	// Initialize VolumeAttributes if needed
+	if pv.VolumeAttributes == nil {
+		pv.VolumeAttributes = make(map[string]string)
+	}
+
+	// Fetch migration metadata from Plan for volume tagging (optional)
+	var migrationMetadata *populator.MigrationMetadata
+	pvc, err := clientSet.CoreV1().PersistentVolumeClaims(targetNamespace).Get(context.Background(), ownerName, metav1.GetOptions{})
+	if err != nil {
+		klog.Warningf("Failed to fetch PVC %s/%s to determine migration metadata: %v", targetNamespace, ownerName, err)
+	} else {
+		// Extract Plan UID from PVC labels
+		planUID := pvc.Labels["plan"]
+		if planUID != "" {
+			// Fetch the Plan to get provider information
+			sourceProvider, _, migrationType, err := getPlanProviders(planUID)
+			if err != nil {
+				klog.Warningf("Failed to fetch Plan providers: %v", err)
+			} else {
+				migrationMetadata = &populator.MigrationMetadata{
+					SourceProvider: sourceProvider,
+					MigrationType:  migrationType,
+				}
+				klog.Infof("Detected migration metadata for PVC %s/%s: source=%s, target=forklift, type=%s, method=xcopy",
+					targetNamespace, ownerName, sourceProvider, migrationType)
+			}
+		} else {
+			klog.Warningf("PVC %s/%s does not have 'plan' label", targetNamespace, ownerName)
+		}
+	}
+
 	progressCounter, xcopyUsedGauge, err := setupTracingMetrics()
 	if err != nil {
 		klog.Fatal(err)
@@ -196,7 +230,7 @@ func main() {
 	quitCh := make(chan error)
 
 	hll := populator.NewHostLeaseLocker(clientSet)
-	go p.Populate(sourceVmId, sourceVMDKFile, pv, hll, progressCh, xCopyUsedCh, quitCh)
+	go p.Populate(sourceVmId, sourceVMDKFile, pv, migrationMetadata, hll, progressCh, xCopyUsedCh, quitCh)
 
 	for {
 		select {
@@ -237,6 +271,78 @@ func newKubeClient(masterURL string, kubeconfig string) (*kubernetes.Clientset, 
 	coreCfg := rest.CopyConfig(cfg)
 	coreCfg.ContentType = runtime.ContentTypeProtobuf
 	return kubernetes.NewForConfig(coreCfg)
+}
+
+// getPlanProviders fetches the Plan object and extracts source provider, destination provider, and migration type
+func getPlanProviders(planUID string) (sourceProvider, destProvider, migrationType string, err error) {
+	// Create a controller-runtime client to fetch Forklift Plan CRs
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to get in-cluster config: %w", err)
+	}
+
+	// Register Forklift scheme
+	s := runtime.NewScheme()
+	if err := scheme.AddToScheme(s); err != nil {
+		return "", "", "", fmt.Errorf("failed to add core scheme: %w", err)
+	}
+	if err := forklift.SchemeBuilder.AddToScheme(s); err != nil {
+		return "", "", "", fmt.Errorf("failed to add forklift scheme: %w", err)
+	}
+
+	// Create controller-runtime client
+	k8sClient, err := client.New(cfg, client.Options{Scheme: s})
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to create controller-runtime client: %w", err)
+	}
+
+	// List all Plans to find the one with matching UID
+	planList := &forklift.PlanList{}
+	if err := k8sClient.List(context.Background(), planList); err != nil {
+		return "", "", "", fmt.Errorf("failed to list Plans: %w", err)
+	}
+
+	var plan *forklift.Plan
+	for i := range planList.Items {
+		if string(planList.Items[i].UID) == planUID {
+			plan = &planList.Items[i]
+			break
+		}
+	}
+
+	if plan == nil {
+		return "", "", "", fmt.Errorf("Plan with UID %s not found", planUID)
+	}
+
+	// Fetch source provider
+	sourceProviderObj := &forklift.Provider{}
+	sourceProviderKey := types.NamespacedName{
+		Name:      plan.Spec.Provider.Source.Name,
+		Namespace: plan.Spec.Provider.Source.Namespace,
+	}
+	if err := k8sClient.Get(context.Background(), sourceProviderKey, sourceProviderObj); err != nil {
+		return "", "", "", fmt.Errorf("failed to get source provider: %w", err)
+	}
+	sourceProvider = string(sourceProviderObj.Type())
+
+	// Fetch destination provider
+	destProviderObj := &forklift.Provider{}
+	destProviderKey := types.NamespacedName{
+		Name:      plan.Spec.Provider.Destination.Name,
+		Namespace: plan.Spec.Provider.Destination.Namespace,
+	}
+	if err := k8sClient.Get(context.Background(), destProviderKey, destProviderObj); err != nil {
+		return "", "", "", fmt.Errorf("failed to get destination provider: %w", err)
+	}
+	destProvider = string(destProviderObj.Type())
+
+	// Determine migration type (warm vs cold)
+	migrationType = "cold"
+	if plan.IsWarm() {
+		migrationType = "warm"
+	}
+
+	return sourceProvider, destProvider, migrationType, nil
 }
 
 // getPv extract the volume handle from the PVC. To detect the volume of the said targetPVC we need

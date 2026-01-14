@@ -14,6 +14,18 @@ type StorageApi interface {
 	VMDKCapable
 }
 
+// MigrationMetadata contains metadata about the migration for volume tagging
+type MigrationMetadata struct {
+	SourceProvider string // e.g., "vmware", "ovirt", "openstack", "ova"
+	MigrationType  string // e.g., "cold", "warm"
+}
+
+// VolumeTaggingSupport is an optional interface for storage vendors that support volume tagging
+// Only implement this interface if the storage vendor supports tagging volumes with metadata
+type VolumeTaggingSupport interface {
+	TagVolume(volumeName string, context MappingContext) error
+}
+
 // StorageResolver resolves a PersistentVolume to LUN details
 // This interface is embedded by VVolCapable, RDMCapable, and VMDKCapable
 type StorageResolver interface {

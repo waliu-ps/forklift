@@ -11,7 +11,8 @@ type Populator interface {
 	// the sourceVMDKFile.
 	// persistentVolume is a slim version of k8s PersistentVolume created by the CSI driver,
 	// to help identify its underlying LUN in the storage system.
-	Populate(vmId string, sourceVMDKFile string, persistentVolume PersistentVolume, hostLocker Hostlocker, progress chan<- uint64, xcopyUsed chan<- int, quit chan error) error
+	// migrationMetadata contains optional metadata about the migration for volume tagging.
+	Populate(vmId string, sourceVMDKFile string, persistentVolume PersistentVolume, migrationMetadata *MigrationMetadata, hostLocker Hostlocker, progress chan<- uint64, xcopyUsed chan<- int, quit chan error) error
 }
 
 //go:generate go run go.uber.org/mock/mockgen -destination=mocks/hostlocker_mock.go -package=mocks . Hostlocker
@@ -86,4 +87,20 @@ func ParseVmdkPath(vmdkPath string) (VMDisk, error) {
 		VmHomeDir: pathParts[0],
 		VmdkFile:  pathParts[1],
 	}, nil
+}
+
+// StoreMigrationMetadata stores migration metadata in PV volume attributes
+// This is used by storage implementations that support volume tagging (e.g., Pure Storage)
+// to extract metadata and tag volumes during copy operations.
+func StoreMigrationMetadata(pv *PersistentVolume, metadata *MigrationMetadata) {
+	if metadata == nil {
+		return
+	}
+
+	if pv.VolumeAttributes == nil {
+		pv.VolumeAttributes = make(map[string]string)
+	}
+
+	pv.VolumeAttributes["migration.forklift.konveyor.io/source-provider"] = metadata.SourceProvider
+	pv.VolumeAttributes["migration.forklift.konveyor.io/migration-type"] = metadata.MigrationType
 }

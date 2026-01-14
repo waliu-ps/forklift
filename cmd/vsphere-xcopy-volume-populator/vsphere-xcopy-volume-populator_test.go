@@ -80,7 +80,7 @@ var _ = Describe("Populator", func() {
 
 			go func() {
 				defer GinkgoRecover()
-				underTest.Populate(tc.sourceVmId, tc.sourceVMDK, populator.PersistentVolume{Name: tc.targetPVC}, hostLocker, progressCh, xcopyUsedCh, quitCh)
+				underTest.Populate(tc.sourceVmId, tc.sourceVMDK, populator.PersistentVolume{Name: tc.targetPVC}, nil, hostLocker, progressCh, xcopyUsedCh, quitCh)
 			}()
 
 			if tc.want != nil {
@@ -149,7 +149,7 @@ var _ = Describe("Populator", func() {
 				storageClient.EXPECT().EnsureClonnerIgroup(gomock.Any(), gomock.Any()).Return(nil, nil)
 				storageClient.EXPECT().ResolvePVToLUN(gomock.Any()).Return(populator.LUN{NAA: "naa.616263"}, nil)
 				storageClient.EXPECT().CurrentMappedGroups(gomock.Any(), gomock.Any()).Return([]string{}, nil)
-				storageClient.EXPECT().Map("xcopy-esxs", gomock.Any(), nil).Return(populator.LUN{NAA: "naa.616263"}, nil)
+				storageClient.EXPECT().Map("xcopy-esxs", gomock.Any(), gomock.Any()).Return(populator.LUN{NAA: "naa.616263"}, nil)
 				// Mock rescan device list call (happens inside hostLocker.WithLock) - returns "on" status
 				vmwareClient.EXPECT().RunEsxCommand(context.Background(), gomock.Any(), []string{"storage", "core", "device", "list", "-d", "naa.616263"}).Return([]esx.Values{{"Status": {"on"}}}, nil).Times(1)
 				vmwareClient.EXPECT().RunEsxCommand(context.Background(), gomock.Any(),
@@ -163,7 +163,7 @@ var _ = Describe("Populator", func() {
 				vmwareClient.EXPECT().RunEsxCommand(context.Background(), gomock.Any(), []string{"storage", "core", "device", "list", "-d", "naa.616263"}).Return([]esx.Values{map[string][]string{"Status": {"off"}}}, nil).AnyTimes()
 				vmwareClient.EXPECT().RunEsxCommand(context.Background(), gomock.Any(), []string{"storage", "core", "device", "detached", "remove", "-d", "naa.616263"}).Return(nil, nil)
 				vmwareClient.EXPECT().RunEsxCommand(context.Background(), gomock.Any(), []string{"storage", "core", "adapter", "rescan", "-t", "delete", "-A", "vmhbatest"}).Return(nil, nil)
-				storageClient.EXPECT().UnMap("xcopy-esxs", gomock.Any(), nil).Return(nil)
+				storageClient.EXPECT().UnMap("xcopy-esxs", gomock.Any(), gomock.Any()).Return(nil)
 				// Mock hostLocker to actually execute the callback function
 				hostLocker.EXPECT().WithLock(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
 					func(ctx context.Context, hostID string, work func(context.Context) error) error {
