@@ -452,20 +452,40 @@ func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkP
 		// Check different backing types
 		switch backing := disk.Backing.(type) {
 		case *types.VirtualDiskFlatVer2BackingInfo:
-			// Check if this disk matches the requested path
-			if !strings.Contains(strings.ToLower(backing.FileName), normalizedPath) &&
-				!strings.Contains(normalizedPath, strings.ToLower(backing.FileName)) {
-				// Try to match by extracting datastore and path
-				if !diskPathMatches(backing.FileName, vmdkPath) {
-					continue
-				}
+			// Match against the top-level backing or any ancestor in the
+			// Parent chain. The walk is needed when a snapshot is active
+			// (e.g. forklift's warm-precopy snapshot) because the top
+			// backing is then a delta redo-log whose filename does not
+			// match the requested base path; the original path lives on
+			// an ancestor backing.
+			if !flatBackingMatchesPath(backing, normalizedPath, vmdkPath) {
+				continue
 			}
 
-			// Check for VVol backing
-			if backing.BackingObjectId != "" {
-				log.V(2).Info("disk is VVol-backed", "vmdk", vmdkPath, "backing_object_id", backing.BackingObjectId)
+			// Authoritatively classify the disk via its base disk's
+			// datastore type. The base lives at the bottom of the Parent
+			// chain; checking it (rather than the top-of-chain backing)
+			// is robust to redo-log redirection (workingDir /
+			// snapshot.fileLocation overrides) on mixed-storage VMs.
+			isVVol, dsErr := c.isVVolDatastore(ctx, baseFlatBacking(backing).Datastore)
+			if dsErr != nil {
+				log.V(1).Info("failed to determine datastore type, treating as VMDK",
+					"vmdk", vmdkPath, "err", dsErr.Error())
+			}
+
+			if isVVol {
+				// The BackingObjectId we need for the clone fast path
+				// may live on an ancestor backing because snapshot delta
+				// redo-logs carry an empty BackingObjectId of their own.
+				vvolId := findVVolBackingObjectId(backing)
+				if vvolId == "" {
+					log.Info("vVol-backed disk has empty BackingObjectId across the entire chain",
+						"vmdk", vmdkPath)
+				} else {
+					log.V(2).Info("disk is VVol-backed", "vmdk", vmdkPath, "backing_object_id", vvolId)
+				}
 				return &DiskBacking{
-					VVolId:     backing.BackingObjectId,
+					VVolId:     vvolId,
 					IsRDM:      false,
 					DeviceName: backing.FileName,
 				}, nil
@@ -572,16 +592,24 @@ func (c *VSphereClient) GetVirtualDiskSizes(ctx context.Context, vmId, vmdkPath 
 		}
 		switch backing := disk.Backing.(type) {
 		case *types.VirtualDiskFlatVer2BackingInfo:
-			if !strings.Contains(strings.ToLower(backing.FileName), normalizedPath) &&
-				!strings.Contains(normalizedPath, strings.ToLower(backing.FileName)) {
-				if !diskPathMatches(backing.FileName, vmdkPath) {
-					continue
-				}
+			if !flatBackingMatchesPath(backing, normalizedPath, vmdkPath) {
+				continue
 			}
 			matchedDisk = disk
-			if backing.BackingObjectId != "" {
-				log.V(2).Info("disk is VVol-backed", "vmdk", vmdkPath, "backing_object_id", backing.BackingObjectId)
-				diskBacking = &DiskBacking{VVolId: backing.BackingObjectId, DeviceName: backing.FileName}
+			isVVol, dsErr := c.isVVolDatastore(ctx, baseFlatBacking(backing).Datastore)
+			if dsErr != nil {
+				log.V(1).Info("failed to determine datastore type, treating as VMDK",
+					"vmdk", vmdkPath, "err", dsErr.Error())
+			}
+			if isVVol {
+				vvolId := findVVolBackingObjectId(backing)
+				if vvolId == "" {
+					log.Info("vVol-backed disk has empty BackingObjectId across the entire chain",
+						"vmdk", vmdkPath)
+				} else {
+					log.V(2).Info("disk is VVol-backed", "vmdk", vmdkPath, "backing_object_id", vvolId)
+				}
+				diskBacking = &DiskBacking{VVolId: vvolId, DeviceName: backing.FileName}
 			} else {
 				log.V(2).Info("disk is VMDK-backed", "vmdk", vmdkPath)
 				diskBacking = &DiskBacking{DeviceName: backing.FileName}
@@ -668,6 +696,66 @@ func diskPathMatches(path1, path2 string) bool {
 	}
 
 	return normalize(path1) == normalize(path2)
+}
+
+// flatBackingMatchesPath reports whether vmdkPath matches the supplied flat
+// backing or any backing in its Parent chain. Walking the chain is required
+// when a snapshot is active because the delta redo-log at the top of the
+// chain has a different filename than the originally-requested base path;
+// for non-snapshotted disks Parent is nil and the loop runs once.
+func flatBackingMatchesPath(b *types.VirtualDiskFlatVer2BackingInfo, normalizedPath, vmdkPath string) bool {
+	for cur := b; cur != nil; cur = cur.Parent {
+		fn := strings.ToLower(cur.FileName)
+		if strings.Contains(fn, normalizedPath) ||
+			strings.Contains(normalizedPath, fn) ||
+			diskPathMatches(cur.FileName, vmdkPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// findVVolBackingObjectId returns the first non-empty BackingObjectId found
+// while walking the supplied flat backing's Parent chain, or "" if none is
+// present. Walking is required because delta redo-logs introduced by
+// snapshots carry an empty BackingObjectId even when the underlying base
+// disk is vVol-backed. Callers should only invoke this once vVol-ness has
+// been confirmed via the disk's datastore type.
+func findVVolBackingObjectId(b *types.VirtualDiskFlatVer2BackingInfo) string {
+	for cur := b; cur != nil; cur = cur.Parent {
+		if cur.BackingObjectId != "" {
+			return cur.BackingObjectId
+		}
+	}
+	return ""
+}
+
+// baseFlatBacking returns the bottom-most ancestor of the supplied flat
+// backing (the base disk). For non-snapshotted disks Parent is nil and the
+// input is returned unchanged.
+func baseFlatBacking(b *types.VirtualDiskFlatVer2BackingInfo) *types.VirtualDiskFlatVer2BackingInfo {
+	cur := b
+	for cur != nil && cur.Parent != nil {
+		cur = cur.Parent
+	}
+	return cur
+}
+
+// isVVolDatastore reports whether the supplied datastore moref refers to a
+// vVol-type datastore by reading its summary.type property. Returns
+// (false, nil) when ref is nil. The datastore type is intrinsic to the
+// datastore and unaffected by VM-level operations such as snapshots, which
+// makes it a more robust vVol signal than the per-backing BackingObjectId.
+func (c *VSphereClient) isVVolDatastore(ctx context.Context, ref *types.ManagedObjectReference) (bool, error) {
+	if ref == nil {
+		return false, nil
+	}
+	pc := property.DefaultCollector(c.Client.Client)
+	var ds mo.Datastore
+	if err := pc.RetrieveOne(ctx, *ref, []string{"summary.type"}, &ds); err != nil {
+		return false, fmt.Errorf("failed to retrieve datastore summary.type: %w", err)
+	}
+	return ds.Summary.Type == string(types.HostFileSystemVolumeFileSystemTypeVVOL), nil
 }
 
 type Obj struct {
