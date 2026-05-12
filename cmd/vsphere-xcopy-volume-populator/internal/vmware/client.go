@@ -196,15 +196,17 @@ func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkP
 			// Check if this disk matches the requested path
 			if !strings.Contains(strings.ToLower(backing.FileName), normalizedPath) &&
 				!strings.Contains(normalizedPath, strings.ToLower(backing.FileName)) {
+				klog.Infof("backing.FileName: %s, normalizedPath: %s", backing.FileName, normalizedPath)
 				// Try to match by extracting datastore and path
 				if !diskPathMatches(backing.FileName, vmdkPath) {
+					klog.Infof("vmdkpath does not match: %s, %s", backing.FileName, vmdkPath)
 					continue
 				}
 			}
 
 			// Check for VVol backing
 			if backing.BackingObjectId != "" {
-				klog.V(2).Infof("Disk %s is VVol-backed (BackingObjectId: %s)", vmdkPath, backing.BackingObjectId)
+				klog.Infof("Disk %s is VVol-backed (BackingObjectId: %s)", vmdkPath, backing.BackingObjectId)
 				return &DiskBacking{
 					VVolId:     backing.BackingObjectId,
 					IsRDM:      false,
@@ -213,7 +215,7 @@ func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkP
 			}
 
 			// Regular VMDK
-			klog.V(2).Infof("Disk %s is VMDK-backed", vmdkPath)
+			klog.Infof("Disk %s is VMDK-backed", vmdkPath)
 			return &DiskBacking{
 				VVolId:     "",
 				IsRDM:      false,
@@ -229,7 +231,7 @@ func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkP
 				}
 			}
 
-			klog.V(2).Infof("Disk %s is RDM-backed (DeviceName: %s)", vmdkPath, backing.DeviceName)
+			klog.Infof("Disk %s is RDM-backed (DeviceName: %s)", vmdkPath, backing.DeviceName)
 			return &DiskBacking{
 				VVolId:     "",
 				IsRDM:      true,
@@ -239,7 +241,7 @@ func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkP
 	}
 
 	// If we couldn't find the disk, return default VMDK type
-	klog.V(2).Infof("Could not find specific disk %s, assuming VMDK type", vmdkPath)
+	klog.Infof("Could not find specific disk %s, assuming VMDK type", vmdkPath)
 	return &DiskBacking{
 		VVolId:     "",
 		IsRDM:      false,
