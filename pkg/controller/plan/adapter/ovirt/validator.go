@@ -217,6 +217,10 @@ func (r *Validator) DirectStorage(vmRef ref.Ref) (ok bool, err error) {
 	return
 }
 
+func (r *Validator) ConsistentOffload(vmRef ref.Ref) (bool, error) {
+	return true, nil
+}
+
 // Checks the version for ovirt direct LUN/FC
 func (r *Validator) canImportDirectDisksFromProvider() (bool, error) {
 	// validate ovirt version > ovirt-engine-4.5.2.1 (https://github.com/oVirt/ovirt-engine/commit/e7c1f585863a332bcecfc8c3d909c9a3a56eb922)

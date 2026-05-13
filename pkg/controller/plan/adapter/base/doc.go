@@ -203,6 +203,9 @@ type Validator interface {
 	StorageMapped(vmRef ref.Ref) (bool, error)
 	// Validate that a VM's direct LUN/FC has the required details (oVirt only)
 	DirectStorage(vmRef ref.Ref) (bool, error)
+	// Validate that all of a VM's mapped datastores share a consistent offload-plugin
+	// configuration — either all have an OffloadPlugin set, or none do.
+	ConsistentOffload(vmRef ref.Ref) (bool, error)
 	// Validate that a VM's networks have been mapped.
 	NetworksMapped(vmRef ref.Ref) (bool, error)
 	// Validate that a VM's Host isn't in maintenance mode.

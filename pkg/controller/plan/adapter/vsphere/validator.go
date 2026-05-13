@@ -131,6 +131,41 @@ func (r *Validator) StorageMapped(vmRef ref.Ref) (ok bool, err error) {
 	return
 }
 
+// ConsistentOffload checks that every datastore used by the VM's disks has the same
+// offload-plugin state in the storage map: either all entries have OffloadPlugin set
+// or none do. Mixed configurations are rejected because the populator/CDI dispatching
+// is plan-wide, not per-disk, and would crash or silently drop disks at runtime.
+func (r *Validator) ConsistentOffload(vmRef ref.Ref) (ok bool, err error) {
+	if r.Plan.Referenced.Map.Storage == nil {
+		ok = true
+		return
+	}
+	vm := &model.VM{}
+	err = r.Source.Inventory.Find(vm, vmRef)
+	if err != nil {
+		err = liberr.Wrap(err, "vm", vmRef.String())
+		return
+	}
+
+	dsMap := r.Plan.Referenced.Map.Storage.Spec.Map
+	var sawOffload, sawNoOffload bool
+	for _, disk := range vm.Disks {
+		for i := range dsMap {
+			if dsMap[i].Source.ID != disk.Datastore.ID {
+				continue
+			}
+			if dsMap[i].OffloadPlugin != nil && dsMap[i].OffloadPlugin.VSphereXcopyPluginConfig != nil {
+				sawOffload = true
+			} else {
+				sawNoOffload = true
+			}
+			break
+		}
+	}
+	ok = !(sawOffload && sawNoOffload)
+	return
+}
+
 // isValidTemplate executes the template with test data and validates the output.
 func isValidTemplate(templateStr string, testData interface{}) (string, error) {
 	// Execute the template with test data

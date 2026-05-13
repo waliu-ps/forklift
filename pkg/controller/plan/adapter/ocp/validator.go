@@ -354,6 +354,10 @@ func (r *Validator) DirectStorage(vmRef ref.Ref) (bool, error) {
 	return true, nil
 }
 
+func (r *Validator) ConsistentOffload(vmRef ref.Ref) (bool, error) {
+	return true, nil
+}
+
 // NO-OP
 func (r *Validator) UdnStaticIPs(vmRef ref.Ref, client k8sclient.Client) (ok bool, err error) {
 	return true, nil

@@ -194,6 +194,10 @@ func (r *Validator) DirectStorage(vmRef ref.Ref) (bool, error) {
 	return true, nil
 }
 
+func (r *Validator) ConsistentOffload(vmRef ref.Ref) (bool, error) {
+	return true, nil
+}
+
 // NO-OP
 func (r *Validator) StaticIPs(vmRef ref.Ref) (bool, error) {
 	// the guest operating system is not modified during the migration so static IPs should be preserved

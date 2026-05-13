@@ -57,6 +57,7 @@ const (
 	VMNetworksNotMapped             = "VMNetworksNotMapped"
 	VMStorageNotMapped              = "VMStorageNotMapped"
 	VMStorageNotSupported           = "VMStorageNotSupported"
+	VMStorageOffloadInconsistent    = "VMStorageOffloadInconsistent"
 	VMMultiplePodNetworkMappings    = "VMMultiplePodNetworkMappings"
 	VMMissingGuestIPs               = "VMMissingGuestIPs"
 	VMIpNotMatchingUdnSubnet        = "VMIpNotMatchingUdnSubnet"
@@ -610,6 +611,14 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		Message:  "VM has unsupported storage. Migration of Direct LUN/FC from oVirt is supported as from version 4.5.2.1",
 		Items:    []string{},
 	}
+	inconsistentOffload := libcnd.Condition{
+		Type:     VMStorageOffloadInconsistent,
+		Status:   True,
+		Reason:   NotValid,
+		Category: api.CategoryCritical,
+		Message:  "VM has disks on a mix of offload-enabled and non-offload-enabled datastores. All datastores used by the VM must be mapped with the same offload plugin configuration.",
+		Items:    []string{},
+	}
 	maintenanceMode := libcnd.Condition{
 		Type:     HostNotReady,
 		Status:   True,
@@ -893,6 +902,13 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 			if !ok {
 				unsupportedStorage.Items = append(unsupportedStorage.Items, ref.String())
 			}
+			ok, err = validator.ConsistentOffload(*ref)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				inconsistentOffload.Items = append(inconsistentOffload.Items, ref.String())
+			}
 		}
 		ok, err := validator.MaintenanceMode(*ref)
 		if err != nil {
@@ -1108,6 +1124,9 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 	}
 	if len(unsupportedStorage.Items) > 0 {
 		plan.Status.SetCondition(unsupportedStorage)
+	}
+	if len(inconsistentOffload.Items) > 0 {
+		plan.Status.SetCondition(inconsistentOffload)
 	}
 	if len(maintenanceMode.Items) > 0 {
 		plan.Status.SetCondition(maintenanceMode)
