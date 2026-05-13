@@ -881,6 +881,11 @@ func (r *Builder) persistentVolumeClaimWithSourceRef(diskAttachment model.XDiskA
 	return
 }
 
+func (r *Builder) PopulatorVolumesForCutover(vmRef ref.Ref, annotations map[string]string, secretName string) (pvcs []*core.PersistentVolumeClaim, err error) {
+	err = planbase.VolumePopulatorNotSupportedError
+	return
+}
+
 func (r *Builder) PopulatorTransferredBytes(pvc *core.PersistentVolumeClaim) (transferredBytes int64, err error) {
 	if _, ok := pvc.Annotations["lun"]; ok {
 		// skip LUNs

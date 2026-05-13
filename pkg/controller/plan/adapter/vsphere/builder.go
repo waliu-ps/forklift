@@ -1305,9 +1305,64 @@ func (r *Builder) SupportsVolumePopulators() bool {
 	return false
 }
 
-// PopulatorVolumes creates PVC in case the their are needed for the disks
-// in context, and according to the offload plugin configuration in the StorageMap
-func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string, secretName string) (pvcs []*core.PersistentVolumeClaim, err error) {
+// PopulatorVolumes creates PVCs and VSphereXcopyVolumePopulator CRs for the disks
+// of vmRef, following the offload-plugin configuration in the StorageMap. Used
+// by both warm precopy and cold migration entry into the populator path.
+func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string, secretName string) ([]*core.PersistentVolumeClaim, error) {
+	return r.buildPopulatorVolumes(vmRef, annotations, secretName, populatorModePrecopy)
+}
+
+// lookupDatastoreNAA opens a short-lived vSphere client to read the datastore NAA
+// identifier (used as an optional storage-affinity label on the PVC). Errors are
+// logged and swallowed because the label is optional — returning "" is safe.
+func (r *Builder) lookupDatastoreNAA(dsID, dsName string) string {
+	vsphereClient := &Client{Context: r.Context}
+	if err := vsphereClient.connect(); err != nil {
+		r.Log.Error(err, "failed to connect to vSphere client, continuing without storage affinity label")
+		return ""
+	}
+	defer vsphereClient.Close()
+	naa, err := vsphereClient.getNAAFromDatastore(context.TODO(), ref.Ref{ID: dsID, Name: dsName})
+	if err != nil {
+		r.Log.Error(err, "failed to get NAA from datastore, continuing without storage affinity label", "datastore", dsName)
+		return ""
+	}
+	return naa
+}
+
+// PopulatorVolumesForCutover creates PVCs and VSphereXcopyVolumePopulator CRs for warm cutover.
+// Unlike PopulatorVolumes, no CDI warm annotations are set — the populator performs a full array
+// copy from the final snapshot, taking advantage of Pure FlashArray copy-on-write efficiency.
+func (r *Builder) PopulatorVolumesForCutover(vmRef ref.Ref, annotations map[string]string, secretName string) ([]*core.PersistentVolumeClaim, error) {
+	return r.buildPopulatorVolumes(vmRef, annotations, secretName, populatorModeCutover)
+}
+
+// populatorMode selects the two flavors of populator-PVC building shared by
+// PopulatorVolumes (warm precopy / cold) and PopulatorVolumesForCutover.
+type populatorMode int
+
+const (
+	populatorModePrecopy populatorMode = iota
+	populatorModeCutover
+)
+
+// buildPopulatorVolumes is the shared implementation behind PopulatorVolumes and
+// PopulatorVolumesForCutover. The mode parameter selects:
+//   - which existing PVCs are queried (cutover narrows to its own to avoid the
+//     still-present precopy PVCs)
+//   - which storage-map entries are processed (cutover only acts on Pure
+//     FlashArray xcopy mappings)
+//   - the PVC label set (cutover marks "cutover"; warm precopy marks "precopy"
+//     so DeletePrecopyVolumes can use an explicit allow-list)
+//   - PVC/populator name suffix (cutover appends "-cutover")
+//   - whether CDI warm-migration annotations are applied (precopy only, when
+//     the plan VM has a Warm status)
+func (r *Builder) buildPopulatorVolumes(
+	vmRef ref.Ref,
+	annotations map[string]string,
+	secretName string,
+	mode populatorMode,
+) (pvcs []*core.PersistentVolumeClaim, err error) {
 	vm := &model.VM{}
 	err = r.Source.Inventory.Find(vm, vmRef)
 	if err != nil {
@@ -1315,17 +1370,19 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 		return
 	}
 
-	// Get a list of existing PVCs to avoid creating duplicates
-	pvcLabels := map[string]string{
+	existingPvcSelector := map[string]string{
 		"migration": string(r.Migration.UID),
 		"vmID":      vmRef.ID,
+	}
+	if mode == populatorModeCutover {
+		existingPvcSelector["cutover"] = "true"
 	}
 	pvcList := &core.PersistentVolumeClaimList{}
 	err = r.Destination.Client.List(
 		context.TODO(),
 		pvcList,
 		&client.ListOptions{
-			LabelSelector: labels.SelectorFromSet(pvcLabels),
+			LabelSelector: labels.SelectorFromSet(existingPvcSelector),
 			Namespace:     r.Plan.Spec.TargetNamespace,
 		})
 	if err != nil {
@@ -1333,13 +1390,30 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 		return
 	}
 
-	// Get sorted disks to maintain consistent indexing with other parts of the system
 	sortedDisks := r.sortedDisksAsVmware(vm.Disks)
+	namespace := r.Plan.Spec.TargetNamespace
+	pvblock := core.PersistentVolumeBlock
+	// For cutover, baseVolume is called with isWarm=false to match the
+	// pre-refactor behavior of PopulatorVolumesForCutover.
+	isWarm := mode == populatorModePrecopy && r.Plan.IsWarm()
+	v := r.getPlanVMStatus(vm)
+	addWarmCDIAnnots := mode == populatorModePrecopy && v != nil && v.Warm != nil
 
 	dsMapIn := r.Context.Map.Storage.Spec.Map
 	dsNaaMap := make(map[string]string)
 	for i := range dsMapIn {
 		mapped := &dsMapIn[i]
+		// Cutover only acts on Pure FlashArray xcopy entries. Precopy
+		// preserves the original behavior of dereferencing OffloadPlugin
+		// directly (the ConsistentOffload validator rejects nil at preflight).
+		if mode == populatorModeCutover {
+			if mapped.OffloadPlugin == nil ||
+				mapped.OffloadPlugin.VSphereXcopyPluginConfig == nil ||
+				mapped.OffloadPlugin.VSphereXcopyPluginConfig.StorageVendorProduct != api.StorageVendorProductPureFlashArray {
+				continue
+			}
+		}
+
 		sourceRef := mapped.Source
 		ds := &model.Datastore{}
 		fErr := r.Source.Inventory.Find(ds, sourceRef)
@@ -1348,192 +1422,184 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 			return
 		}
 
-		pvblock := core.PersistentVolumeBlock
 		for diskIndex, disk := range sortedDisks {
-			if disk.Datastore.ID == ds.ID {
-				naa, ok := dsNaaMap[ds.ID]
-				if !ok {
-					vsphereClient := &Client{Context: r.Context}
-					err = vsphereClient.connect()
-					if err != nil {
-						r.Log.Error(err, "failed to connect to vSphere client, continue without storage affinity label")
-					}
-					naa, err = vsphereClient.getNAAFromDatastore(context.TODO(), ref.Ref{ID: ds.ID, Name: ds.Name})
-					defer vsphereClient.Close()
-					if err != nil {
-						r.Log.Error(err, "failed to get NAA from datastore %s, continue without storage affinity label", ds.Name)
-					}
-					dsNaaMap[ds.ID] = naa
-				}
-				storageClass := mapped.Destination.StorageClass
-				r.Log.Info(fmt.Sprintf("getting storage mapping by storage class %q and datastore %v datastore name %s datastore", storageClass, disk.Datastore, disk.Datastore))
-				vsphereInstance := r.Context.Plan.Provider.Source.GetName()
-				storageVendorProduct := mapped.OffloadPlugin.VSphereXcopyPluginConfig.StorageVendorProduct
-				storageVendorSecretRef := mapped.OffloadPlugin.VSphereXcopyPluginConfig.SecretRef
+			if disk.Datastore.ID != ds.ID {
+				continue
+			}
 
-				r.Log.Info(fmt.Sprintf("vsphere provider %v storage vendor product %v storage secret name %v ", vsphereInstance, storageVendorProduct, storageVendorSecretRef))
+			naa, cached := dsNaaMap[ds.ID]
+			if !cached {
+				naa = r.lookupDatastoreNAA(ds.ID, ds.Name)
+				dsNaaMap[ds.ID] = naa
+			}
 
-				if vsphereInstance == "" || storageVendorProduct == "" || storageVendorSecretRef == "" {
-					return nil, fmt.Errorf(
-						"the offload plugin configuration has missing details, cannot continue with PVC and populator resource creation")
-				}
+			storageClass := mapped.Destination.StorageClass
+			storageVendorProduct := mapped.OffloadPlugin.VSphereXcopyPluginConfig.StorageVendorProduct
+			storageVendorSecretRef := mapped.OffloadPlugin.VSphereXcopyPluginConfig.SecretRef
+			vsphereInstance := r.Context.Plan.Provider.Source.GetName()
+			if vsphereInstance == "" || storageVendorProduct == "" || storageVendorSecretRef == "" {
+				err = fmt.Errorf("the offload plugin configuration has missing details, cannot create populator PVC")
+				return
+			}
 
-				namespace := r.Plan.Spec.TargetNamespace
-				labels := map[string]string{
-					"migration": string(r.Migration.UID),
-					// we need uniqness and a value which is less than 64 chars, hence using vmRef.id + disk.key
-					"vmdkKey": fmt.Sprint(disk.Key),
-					"vmID":    vmRef.ID,
+			pvcLabelSet := map[string]string{
+				"migration": string(r.Migration.UID),
+				// vmdkKey gives label uniqueness while staying under 64 chars
+				"vmdkKey": fmt.Sprint(disk.Key),
+				"vmID":    vmRef.ID,
+			}
+			switch mode {
+			case populatorModeCutover:
+				pvcLabelSet["cutover"] = "true"
+			case populatorModePrecopy:
+				// Precopy PVCs for a warm migration are deleted by
+				// DeletePrecopyVolumes at cutover. Mark them so the deletion
+				// is an explicit allow-list rather than label absence.
+				if isWarm {
+					pvcLabelSet["precopy"] = "true"
 				}
-				// Only add the NAA label if it's a valid Kubernetes label value
-				if errs := k8svalidation.IsValidLabelValue(naa); len(errs) == 0 {
-					labels[TemplateNAALabel] = naa
-				}
+			}
+			if errs := k8svalidation.IsValidLabelValue(naa); len(errs) == 0 {
+				pvcLabelSet[TemplateNAALabel] = naa
+			}
 
-				r.Log.Info("target namespace for migration", "namespace", namespace)
-				pvc := core.PersistentVolumeClaim{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace:   namespace,
-						Labels:      labels,
-						Annotations: annotations,
-					},
-					Spec: core.PersistentVolumeClaimSpec{
-						StorageClassName: &storageClass,
-						VolumeMode:       &pvblock,
-						Resources: core.VolumeResourceRequirements{
-							Requests: core.ResourceList{
-								core.ResourceStorage: *resource.NewQuantity(disk.Capacity, resource.BinarySI),
-							},
-						},
-						DataSourceRef: &core.TypedObjectReference{
-							APIGroup: &api.SchemeGroupVersion.Group,
-							Kind:     api.VSphereXcopyVolumePopulatorKind,
+			pvc := core.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   namespace,
+					Labels:      pvcLabelSet,
+					Annotations: annotations,
+				},
+				Spec: core.PersistentVolumeClaimSpec{
+					StorageClassName: &storageClass,
+					VolumeMode:       &pvblock,
+					Resources: core.VolumeResourceRequirements{
+						Requests: core.ResourceList{
+							core.ResourceStorage: *resource.NewQuantity(disk.Capacity, resource.BinarySI),
 						},
 					},
-				}
-				if mapped.Destination.AccessMode != "" {
-					pvc.Spec.AccessModes = []core.PersistentVolumeAccessMode{mapped.Destination.AccessMode}
-				} else {
-					pvc.Spec.AccessModes = []core.PersistentVolumeAccessMode{core.ReadWriteMany}
-				}
-
-				if annotations == nil {
-					pvc.Annotations = make(map[string]string)
-				} else {
-					pvc.Annotations = annotations
-				}
-				pvc.Annotations[planbase.AnnDiskSource] = baseVolume(disk.File, r.Plan.IsWarm())
-				pvc.Annotations["copy-offload"] = baseVolume(disk.File, r.Plan.IsWarm())
-
-				// Apply PVC template naming if configured, replacing the commonName
-				if err := r.setColdMigrationDefaultPVCName(&pvc.ObjectMeta, vm, diskIndex, disk); err != nil {
-					r.Log.Info("Failed to set PVC name from template for populator volume, using default name", "error", err)
-				}
-
-				// PVC name is the name of the populator, and we can't use generateName for the populator
-				// if generateName is used, we need to remove it and set a deterministic name
-				if pvc.ObjectMeta.GenerateName != "" {
-					// For GenerateName, use the generateName prefix as the populator name
-					pvc.ObjectMeta.Name = strings.TrimSuffix(pvc.ObjectMeta.GenerateName, "-") + "-" + uuid.New().String()[:8]
-					pvc.ObjectMeta.GenerateName = ""
-				}
-
-				// populator name is the name of the populator, and we can't use generateName for the populator
-				populatorName := pvc.ObjectMeta.Name
-
-				// For warm migration, add annotations to jump-start the DataVolume
-				v := r.getPlanVMStatus(vm)
-				if v != nil && v.Warm != nil {
-					pvc.Annotations[planbase.AnnEndpoint] = r.Source.Provider.Spec.URL
-					pvc.Annotations[planbase.AnnImportBackingFile] = baseVolume(disk.File, r.Plan.IsWarm())
-					pvc.Annotations[planbase.AnnUUID] = vm.UUID
-					pvc.Annotations[planbase.AnnThumbprint] = r.Source.Provider.Status.Fingerprint
-					pvc.Annotations[planbase.AnnVddkInitImageURL] = settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
-					pvc.Annotations[planbase.AnnPodPhase] = "Succeeded"
-					pvc.Annotations[planbase.AnnSource] = "vddk"
-
-					n := len(v.Warm.Precopies)
-					if n > 0 { // Should be 1 at this point
-						snapshot := v.Warm.Precopies[n-1].Snapshot
-						pvc.Annotations[planbase.AnnFinalCheckpoint] = "false"
-						pvc.Annotations[planbase.AnnCurrentCheckpoint] = snapshot
-						pvc.Annotations[planbase.AnnPreviousCheckpoint] = ""
-
-						copied := fmt.Sprintf("%s.%s", planbase.AnnCheckpointsCopied, snapshot)
-						pvc.Annotations[copied] = "xcopy-initial-offload"                // Any value should work here
-						pvc.Annotations[planbase.AnnImportPod] = "xcopy-initial-offload" // Should match above
-					}
-				}
-
-				// Update DataSourceRef to point to the volume populator
-				pvc.Spec.DataSourceRef.Name = populatorName
-				diskSecretName := fmt.Sprintf("%s-%d", secretName, diskIndex)
-				pvc.Annotations[planbase.AnnSecret] = diskSecretName
-				pvcs = append(pvcs, &pvc)
-				vp := api.VSphereXcopyVolumePopulator{
-					ObjectMeta: metav1.ObjectMeta{
-						OwnerReferences: []metav1.OwnerReference{
-							{
-								APIVersion: "v1",
-								Kind:       "PersistentVolumeClaim",
-								Name:       pvc.Name,
-								UID:        pvc.UID,
-							},
-						},
-						Name:      populatorName,
-						Namespace: namespace,
-						Labels:    labels,
+					DataSourceRef: &core.TypedObjectReference{
+						APIGroup: &api.SchemeGroupVersion.Group,
+						Kind:     api.VSphereXcopyVolumePopulatorKind,
 					},
-					Spec: api.VSphereXcopyVolumePopulatorSpec{
-						VmId:                 vmRef.ID,
-						VmdkPath:             baseVolume(disk.File, r.Plan.IsWarm()),
-						SecretName:           diskSecretName,
-						StorageVendorProduct: string(storageVendorProduct),
+				},
+			}
+			if mapped.Destination.AccessMode != "" {
+				pvc.Spec.AccessModes = []core.PersistentVolumeAccessMode{mapped.Destination.AccessMode}
+			} else {
+				pvc.Spec.AccessModes = []core.PersistentVolumeAccessMode{core.ReadWriteMany}
+			}
+
+			if annotations == nil {
+				pvc.Annotations = make(map[string]string)
+			} else {
+				pvc.Annotations = annotations
+			}
+			pvc.Annotations[planbase.AnnDiskSource] = baseVolume(disk.File, isWarm)
+			pvc.Annotations["copy-offload"] = baseVolume(disk.File, isWarm)
+
+			if err = r.setColdMigrationDefaultPVCName(&pvc.ObjectMeta, vm, diskIndex, disk); err != nil {
+				r.Log.Info("Failed to set PVC name from template for populator volume, using default name", "error", err)
+				err = nil
+			}
+			// Cutover PVCs share the precopy disk identity and template, so
+			// suffix "-cutover" to avoid colliding with the still-terminating
+			// precopy PVC.
+			if pvc.ObjectMeta.GenerateName != "" {
+				suffix := uuid.New().String()[:8]
+				if mode == populatorModeCutover {
+					suffix = "cutover-" + suffix
+				}
+				pvc.ObjectMeta.Name = strings.TrimSuffix(pvc.ObjectMeta.GenerateName, "-") + "-" + suffix
+				pvc.ObjectMeta.GenerateName = ""
+			} else if mode == populatorModeCutover {
+				pvc.ObjectMeta.Name = pvc.ObjectMeta.Name + "-cutover"
+			}
+
+			if addWarmCDIAnnots {
+				pvc.Annotations[planbase.AnnEndpoint] = r.Source.Provider.Spec.URL
+				pvc.Annotations[planbase.AnnImportBackingFile] = baseVolume(disk.File, isWarm)
+				pvc.Annotations[planbase.AnnUUID] = vm.UUID
+				pvc.Annotations[planbase.AnnThumbprint] = r.Source.Provider.Status.Fingerprint
+				pvc.Annotations[planbase.AnnVddkInitImageURL] = settings.GetVDDKImage(r.Source.Provider.Spec.Settings)
+				pvc.Annotations[planbase.AnnPodPhase] = "Succeeded"
+				pvc.Annotations[planbase.AnnSource] = "vddk"
+
+				n := len(v.Warm.Precopies)
+				if n > 0 {
+					snapshot := v.Warm.Precopies[n-1].Snapshot
+					pvc.Annotations[planbase.AnnFinalCheckpoint] = "false"
+					pvc.Annotations[planbase.AnnCurrentCheckpoint] = snapshot
+					pvc.Annotations[planbase.AnnPreviousCheckpoint] = ""
+
+					copied := fmt.Sprintf("%s.%s", planbase.AnnCheckpointsCopied, snapshot)
+					pvc.Annotations[copied] = "xcopy-initial-offload"
+					pvc.Annotations[planbase.AnnImportPod] = "xcopy-initial-offload"
+				}
+			}
+
+			populatorName := pvc.ObjectMeta.Name
+			diskSecretName := fmt.Sprintf("%s-%d", secretName, diskIndex)
+			pvc.Annotations[planbase.AnnSecret] = diskSecretName
+			pvc.Spec.DataSourceRef.Name = populatorName
+			pvcs = append(pvcs, &pvc)
+
+			vp := api.VSphereXcopyVolumePopulator{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      populatorName,
+					Namespace: namespace,
+					Labels:    pvcLabelSet,
+				},
+				Spec: api.VSphereXcopyVolumePopulatorSpec{
+					VmId:                 vmRef.ID,
+					VmdkPath:             baseVolume(disk.File, isWarm),
+					SecretName:           diskSecretName,
+					StorageVendorProduct: string(storageVendorProduct),
+				},
+			}
+
+			if !r.isPVCExistsInList(&pvc, pvcList) {
+				err = r.Destination.Client.Create(context.TODO(), &pvc, &client.CreateOptions{})
+				if err != nil {
+					if k8serr.IsAlreadyExists(err) {
+						err = nil
+						continue
+					}
+					return nil, err
+				}
+
+				createdPVC := &core.PersistentVolumeClaim{}
+				err = r.Destination.Client.Get(context.TODO(), client.ObjectKey{
+					Namespace: pvc.Namespace,
+					Name:      pvc.Name,
+				}, createdPVC)
+				if err != nil {
+					return nil, err
+				}
+				vp.OwnerReferences = []metav1.OwnerReference{
+					{
+						APIVersion: "v1",
+						Kind:       "PersistentVolumeClaim",
+						Name:       createdPVC.Name,
+						UID:        createdPVC.UID,
 					},
 				}
 
-				if !r.isPVCExistsInList(&pvc, pvcList) {
-					r.Log.Info("Creating pvc", "pvc", pvc)
-					err = r.Destination.Client.Create(context.TODO(), &pvc, &client.CreateOptions{})
-					if err != nil {
-						if k8serr.IsAlreadyExists(err) {
-							continue
-						}
-						return nil, err
-					}
+				err = r.mergeSecrets(secretName, namespace, storageVendorSecretRef, r.Source.Provider.Namespace, diskSecretName, createdPVC)
+				if err != nil {
+					return nil, fmt.Errorf("failed to merge secrets for populator: %w", err)
+				}
 
-					// Fetch the PVC back to get the UID assigned by Kubernetes
-					createdPVC := &core.PersistentVolumeClaim{}
-					err = r.Destination.Client.Get(context.TODO(), client.ObjectKey{
-						Namespace: pvc.Namespace,
-						Name:      pvc.Name,
-					}, createdPVC)
-					if err != nil {
-						return nil, err
-					}
-
-					// Update the populator's owner reference with the actual PVC UID
-					vp.OwnerReferences[0].UID = createdPVC.UID
-
-					err = r.mergeSecrets(secretName, namespace, storageVendorSecretRef, r.Source.Provider.Namespace, diskSecretName, createdPVC)
-					if err != nil {
-						return nil, fmt.Errorf("failed to merge secrets for popoulators %w", err)
-					}
-
-					// Should probably check these separately
-					r.Log.Info("Ensuring a populator service account")
-					err = r.ensurePopulatorServiceAccount(namespace)
-					if err != nil {
-						return nil, err
-					}
-					r.Log.Info("Creating the populator resource", "VSphereXcopyVolumePopulator", vp)
-					err = r.Destination.Client.Create(context.TODO(), &vp, &client.CreateOptions{})
-					if err != nil {
-						return nil, err
-					}
+				err = r.ensurePopulatorServiceAccount(namespace)
+				if err != nil {
+					return nil, err
+				}
+				err = r.Destination.Client.Create(context.TODO(), &vp, &client.CreateOptions{})
+				if err != nil {
+					return nil, err
 				}
 			}
 		}
+
 		if len(pvcs) > 0 {
 			secret := &core.Secret{}
 			err = r.Destination.Client.Get(context.TODO(), client.ObjectKey{
@@ -1543,13 +1609,13 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 			if err != nil {
 				return nil, err
 			}
-			err := controllerutil.SetOwnerReference(pvcs[0], secret, r.Scheme())
-			if err != nil {
-				r.Log.Error(err, "Failed to set pvc as owner reference for migration secret '%s'", secret.Name)
+			ownErr := controllerutil.SetOwnerReference(pvcs[0], secret, r.Scheme())
+			if ownErr != nil {
+				r.Log.Error(ownErr, "Failed to set pvc as owner reference for migration secret", "secret", secret.Name)
 			} else {
 				err = r.Destination.Client.Update(context.TODO(), secret)
 				if err != nil {
-					r.Log.Error(err, "Failed to update migration secret '%s' with owner reference", secret.Name)
+					r.Log.Error(err, "Failed to update migration secret with owner reference", "secret", secret.Name)
 				}
 			}
 		}

@@ -266,7 +266,8 @@ func (r *BaseMigrator) Step(status *plan.VMStatus) (step string) {
 		}
 	case api.PhaseRemovePenultimateSnapshot, api.PhaseWaitForPenultimateSnapshotRemoval, api.PhaseCreateFinalSnapshot,
 		api.PhaseWaitForFinalSnapshot, api.PhaseAddFinalCheckpoint, api.PhaseFinalize, api.PhaseRemoveFinalSnapshot,
-		api.PhaseWaitForFinalSnapshotRemoval, api.PhaseWaitForFinalDataVolumesStatus:
+		api.PhaseWaitForFinalSnapshotRemoval, api.PhaseWaitForFinalDataVolumesStatus,
+		api.PhaseCreateCutoverPopulators, api.PhaseWaitForCutoverPopulators:
 		step = Cutover
 	case api.PhaseCreateGuestConversionPod, api.PhaseConvertGuest:
 		step = ImageConversion
@@ -319,9 +320,20 @@ func (r *BaseMigrator) warmItinerary() *libitr.Itinerary {
 			{Name: api.PhaseWaitForPenultimateSnapshotRemoval, All: VSphere},
 			{Name: api.PhaseCreateFinalSnapshot},
 			{Name: api.PhaseWaitForFinalSnapshot},
-			{Name: api.PhaseAddFinalCheckpoint},
-			{Name: api.PhaseWaitForFinalDataVolumesStatus},
-			{Name: api.PhaseFinalize},
+			{Name: api.PhaseAddFinalCheckpoint, All: StandardWarmCutover},
+			{Name: api.PhaseWaitForFinalDataVolumesStatus, All: StandardWarmCutover},
+			{Name: api.PhaseCreateCutoverPopulators, All: XCopyWarm},
+			{Name: api.PhaseWaitForCutoverPopulators, All: XCopyWarm},
+			// PhaseFinalize waits for CDI DataVolume progress to complete; for
+			// XCopyWarm the cutover PVCs are already Bound and no DVs exist, so
+			// updateCopyProgress can never mark the step done. Skip it.
+			//
+			// Side effect: per-disk task progress in the UI is not updated for
+			// XCopyWarm — the Cutover step is marked complete by NextPhase when
+			// it transitions to a different step (ImageConversion/VMCreation),
+			// but individual tasks stay Pending until then. Functional, not
+			// pretty; revisit once XCopyWarm has its own progress reporter.
+			{Name: api.PhaseFinalize, All: StandardWarmCutover},
 			{Name: api.PhaseRemoveFinalSnapshot, All: VSphere},
 			{Name: api.PhaseWaitForFinalSnapshotRemoval, All: VSphere},
 			{Name: api.PhaseCreateGuestConversionPod, All: RequiresConversion},
@@ -407,11 +419,27 @@ func (r *BasePredicate) Evaluate(flag libitr.Flag) (allowed bool, err error) {
 		allowed = r.context.Plan.IsSourceProviderVSphere()
 	case RunInspection:
 		allowed = r.context.Plan.ShouldRunPreflightInspection()
+	case XCopyWarm:
+		allowed = r.isXCopyWarmOffload()
+	case StandardWarmCutover:
+		allowed = !r.isXCopyWarmOffload()
 	}
 
 	return
 }
 
+// isXCopyWarmOffload returns true when the storage map contains a Pure FlashArray
+// xcopy entry, indicating that cutover should use array offload instead of CDI checkpoints.
+func (r *BasePredicate) isXCopyWarmOffload() bool {
+	for _, m := range r.context.Map.Storage.Spec.Map {
+		if m.OffloadPlugin != nil && m.OffloadPlugin.VSphereXcopyPluginConfig != nil &&
+			m.OffloadPlugin.VSphereXcopyPluginConfig.StorageVendorProduct == api.StorageVendorProductPureFlashArray {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *BasePredicate) Count() int {
-	return 0x80
+	return 0x200
 }

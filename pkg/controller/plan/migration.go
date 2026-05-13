@@ -1137,6 +1137,79 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 			case api.PhaseAddFinalCheckpoint:
 				vm.Phase = api.PhaseWaitForFinalDataVolumesStatus
 			}
+		case api.PhaseCreateCutoverPopulators:
+			step, found := vm.FindStep(r.migrator.Step(vm))
+			if !found {
+				vm.AddError(fmt.Sprintf("Step '%s' not found", r.migrator.Step(vm)))
+				break
+			}
+
+			// Remove precopy PVCs/DVs so CreateVM picks up only the new cutover PVCs.
+			err = r.kubevirt.DeletePrecopyVolumes(vm.Ref)
+			if err != nil {
+				step.AddError(err.Error())
+				err = nil
+				break
+			}
+
+			var pvcs []*core.PersistentVolumeClaim
+			pvcs, err = r.kubevirt.CutoverPopulatorVolumes(vm.Ref)
+			if err != nil {
+				if !errors.As(err, &web.ProviderNotReadyError{}) {
+					r.Log.Error(err, "error creating cutover populator volumes", "vm", vm.Name)
+					step.AddError(err.Error())
+					err = nil
+					break
+				} else {
+					return
+				}
+			}
+
+			err = r.kubevirt.EnsurePopulatorVolumes(vm, pvcs)
+			if err != nil {
+				if !errors.As(err, &web.ProviderNotReadyError{}) {
+					step.AddError(err.Error())
+					err = nil
+					break
+				} else {
+					return
+				}
+			}
+			r.NextPhase(vm)
+		case api.PhaseWaitForCutoverPopulators:
+			step, found := vm.FindStep(r.migrator.Step(vm))
+			if !found {
+				vm.AddError(fmt.Sprintf("Step '%s' not found", r.migrator.Step(vm)))
+				break
+			}
+
+			bound, bErr := r.kubevirt.AreCutoverPopulatorVolumesBound(vm.Ref)
+			if bErr != nil {
+				step.AddError(bErr.Error())
+				break
+			}
+			if bound {
+				r.NextPhase(vm)
+				break
+			}
+			// Bound check failed — track retries so a perpetually-Pending PVC fails the
+			// step instead of looping forever. The DvStatusCheckRetries setting is reused
+			// because the wait semantics (PVC bind) are analogous to the CDI DV wait.
+			retriesAnnotation := step.Annotations[DvStatusCheckRetriesAnnotation]
+			if retriesAnnotation == "" {
+				step.Annotations[DvStatusCheckRetriesAnnotation] = "1"
+				break
+			}
+			retries, atoiErr := strconv.Atoi(retriesAnnotation)
+			if atoiErr != nil {
+				step.AddError(atoiErr.Error())
+				break
+			}
+			if retries >= settings.Settings.DvStatusCheckRetries {
+				step.AddError(fmt.Sprintf("cutover populator PVCs did not bind after %d retries", retries))
+				break
+			}
+			step.Annotations[DvStatusCheckRetriesAnnotation] = strconv.Itoa(retries + 1)
 		case api.PhaseStorePowerState:
 			step, found := vm.FindStep(r.migrator.Step(vm))
 			if !found {

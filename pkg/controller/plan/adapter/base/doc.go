@@ -146,6 +146,9 @@ type Builder interface {
 	SupportsVolumePopulators() bool
 	// Build populator volumes
 	PopulatorVolumes(vmRef ref.Ref, annotations map[string]string, secretName string) ([]*core.PersistentVolumeClaim, error)
+	// PopulatorVolumesForCutover creates PVCs and VSphereXcopyVolumePopulator CRs for warm cutover,
+	// triggering a full array copy from the final snapshot. No CDI warm annotations are added.
+	PopulatorVolumesForCutover(vmRef ref.Ref, annotations map[string]string, secretName string) ([]*core.PersistentVolumeClaim, error)
 	// Transferred bytes
 	PopulatorTransferredBytes(persistentVolumeClaim *core.PersistentVolumeClaim) (transferredBytes int64, err error)
 	// Set the populator PVC labels

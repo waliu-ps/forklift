@@ -601,6 +601,11 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 	return
 }
 
+func (r *Builder) PopulatorVolumesForCutover(vmRef ref.Ref, annotations map[string]string, secretName string) (pvcs []*core.PersistentVolumeClaim, err error) {
+	err = planbase.VolumePopulatorNotSupportedError
+	return
+}
+
 func (r *Builder) PopulatorTransferredBytes(persistentVolumeClaim *core.PersistentVolumeClaim) (transferredBytes int64, err error) {
 	err = planbase.VolumePopulatorNotSupportedError
 	return

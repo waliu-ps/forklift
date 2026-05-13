@@ -1253,6 +1253,11 @@ func (r *Builder) persistentVolumeClaimWithSourceRef(image model.Image,
 	return
 }
 
+func (r *Builder) PopulatorVolumesForCutover(vmRef ref.Ref, annotations map[string]string, secretName string) (pvcs []*core.PersistentVolumeClaim, err error) {
+	err = planbase.VolumePopulatorNotSupportedError
+	return
+}
+
 func (r *Builder) PopulatorTransferredBytes(persistentVolumeClaim *core.PersistentVolumeClaim) (transferredBytes int64, err error) {
 	image, err := r.getImageFromPVC(persistentVolumeClaim)
 	if err != nil {

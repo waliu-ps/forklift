@@ -672,6 +672,101 @@ func (r *KubeVirt) PopulatorVolumes(vmRef ref.Ref) (pvcs []*core.PersistentVolum
 	return r.Builder.PopulatorVolumes(vmRef, annotations, secret.Name)
 }
 
+// CutoverPopulatorVolumes creates PVCs and VSphereXcopyVolumePopulator CRs for warm cutover
+// array offload. Unlike PopulatorVolumes, no CDI warm annotations are added — the populator
+// performs a fresh full copy from the current (post-snapshot) disk state.
+func (r *KubeVirt) CutoverPopulatorVolumes(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, err error) {
+	lbls := r.vmLabels(vmRef)
+	lbls[kPopulator] = "true"
+	secret, err := r.ensureSecret(vmRef, r.copyDataFromProviderSecret, lbls)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+	annotations := r.vmLabels(vmRef)
+	return r.Builder.PopulatorVolumesForCutover(vmRef, annotations, secret.Name)
+}
+
+// AreCutoverPopulatorVolumesBound returns true when every cutover PVC is Bound.
+func (r *KubeVirt) AreCutoverPopulatorVolumesBound(vmRef ref.Ref) (bound bool, err error) {
+	pvcList := &core.PersistentVolumeClaimList{}
+	labelSelector := map[string]string{
+		kVM:       vmRef.ID,
+		"cutover": "true",
+	}
+	err = r.Destination.Client.List(
+		context.TODO(),
+		pvcList,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(labelSelector),
+			Namespace:     r.Plan.Spec.TargetNamespace,
+		})
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+	if len(pvcList.Items) == 0 {
+		err = liberr.New("no cutover populator PVCs found for VM", "vm", vmRef.ID)
+		return
+	}
+	for i := range pvcList.Items {
+		if pvcList.Items[i].Status.Phase != core.ClaimBound {
+			return
+		}
+	}
+	bound = true
+	return
+}
+
+// DeletePrecopyVolumes removes warm-precopy PVCs and their DataVolumes before
+// cutover populator PVCs are created, so that CreateVM picks up only the new
+// PVCs. Selection is allow-list based: only PVCs explicitly labelled with
+// precopy="true" by buildPopulatorVolumes are deleted, so unrelated PVCs on the
+// same VM (e.g. LUNs) are left alone.
+func (r *KubeVirt) DeletePrecopyVolumes(vmRef ref.Ref) (err error) {
+	dvList := &cdi.DataVolumeList{}
+	err = r.Destination.Client.List(
+		context.TODO(),
+		dvList,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(r.vmAllButMigrationLabels(vmRef)),
+			Namespace:     r.Plan.Spec.TargetNamespace,
+		})
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+	for i := range dvList.Items {
+		if dErr := r.Destination.Client.Delete(context.TODO(), &dvList.Items[i]); dErr != nil && !k8serr.IsNotFound(dErr) {
+			err = liberr.Wrap(dErr)
+			return
+		}
+	}
+
+	pvcList := &core.PersistentVolumeClaimList{}
+	err = r.Destination.Client.List(
+		context.TODO(),
+		pvcList,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(map[string]string{
+				kVM:       vmRef.ID,
+				"precopy": "true",
+			}),
+			Namespace: r.Plan.Spec.TargetNamespace,
+		})
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+	for i := range pvcList.Items {
+		if dErr := r.Destination.Client.Delete(context.TODO(), &pvcList.Items[i]); dErr != nil && !k8serr.IsNotFound(dErr) {
+			err = liberr.Wrap(dErr)
+			return
+		}
+	}
+	return
+}
+
 // Ensure the DataVolumes exist on the destination.
 func (r *KubeVirt) EnsureDataVolumes(vm *plan.VMStatus, dataVolumes []cdi.DataVolume) (err error) {
 	dataVolumeList := &cdi.DataVolumeList{}

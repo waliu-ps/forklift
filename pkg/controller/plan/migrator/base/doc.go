@@ -19,6 +19,8 @@ var (
 	OpenstackImageMigration libitr.Flag = 0x20
 	VSphere                 libitr.Flag = 0x40
 	RunInspection           libitr.Flag = 0x80
+	XCopyWarm               libitr.Flag = 0x100
+	StandardWarmCutover     libitr.Flag = 0x200
 )
 
 // Steps.

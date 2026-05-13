@@ -83,6 +83,8 @@ const (
 	PhaseStoreInitialSnapshotDeltas        = "StoreInitialSnapshotDeltas"
 	PhaseStorePowerState                   = "StorePowerState"
 	PhaseStoreSnapshotDeltas               = "StoreSnapshotDeltas"
+	PhaseCreateCutoverPopulators           = "CreateCutoverPopulators"
+	PhaseWaitForCutoverPopulators          = "WaitForCutoverPopulators"
 	PhaseWaitForDataVolumesStatus          = "WaitForDataVolumesStatus"
 	PhaseWaitForFinalDataVolumesStatus     = "WaitForFinalDataVolumesStatus"
 	PhaseWaitForFinalSnapshot              = "WaitForFinalSnapshot"
