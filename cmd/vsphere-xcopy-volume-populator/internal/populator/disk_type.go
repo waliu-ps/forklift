@@ -31,10 +31,10 @@ type populatorSettings struct {
 	// Note: VMDK cannot be disabled as it's the default fallback
 }
 
-func detectDiskType(ctx context.Context, client vmware.Client, vmId string, vmdkPath string) (DiskType, error) {
+func detectDiskType(ctx context.Context, client vmware.Client, vmId string, vmdkPath string, warmOffload bool) (DiskType, error) {
 	klog.V(2).Infof("Detecting disk type for VM %s, disk %s", vmId, vmdkPath)
 
-	backing, err := client.GetVMDiskBacking(ctx, vmId, vmdkPath)
+	backing, err := client.GetVMDiskBacking(ctx, vmId, vmdkPath, warmOffload)
 	if err != nil {
 		return "", fmt.Errorf("failed to get disk backing info: %w", err)
 	}

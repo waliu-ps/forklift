@@ -61,3 +61,9 @@ type MappingContext map[string]any
 type SciniAware interface {
 	SciniRequired() bool
 }
+
+// WarmOffloadCapable indicates storage that supports array offload for warm migration precopy,
+// including snapshot-aware vVol detection when a precopy snapshot is active on the source VM.
+type WarmOffloadCapable interface {
+	SupportsWarmOffload() bool
+}

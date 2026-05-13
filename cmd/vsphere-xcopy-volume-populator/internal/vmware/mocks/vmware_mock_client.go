@@ -89,16 +89,16 @@ func (mr *MockClientMockRecorder) RunEsxCommand(ctx, host, command any) *gomock.
 }
 
 // GetVMDiskBacking mocks base method.
-func (m *MockClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkPath string) (*vmware.DiskBacking, error) {
+func (m *MockClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkPath string, warmOffload bool) (*vmware.DiskBacking, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetVMDiskBacking", ctx, vmId, vmdkPath)
+	ret := m.ctrl.Call(m, "GetVMDiskBacking", ctx, vmId, vmdkPath, warmOffload)
 	ret0, _ := ret[0].(*vmware.DiskBacking)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // GetVMDiskBacking indicates an expected call of GetVMDiskBacking.
-func (mr *MockClientMockRecorder) GetVMDiskBacking(ctx, vmId, vmdkPath any) *gomock.Call {
+func (mr *MockClientMockRecorder) GetVMDiskBacking(ctx, vmId, vmdkPath, warmOffload any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetVMDiskBacking", reflect.TypeOf((*MockClient)(nil).GetVMDiskBacking), ctx, vmId, vmdkPath)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetVMDiskBacking", reflect.TypeOf((*MockClient)(nil).GetVMDiskBacking), ctx, vmId, vmdkPath, warmOffload)
 }

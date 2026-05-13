@@ -40,7 +40,12 @@ func NewPopulator(
 
 	ctx := context.Background()
 
-	diskType, err := detectDiskType(ctx, vsphereClient, vmId, vmdkPath)
+	warmOffload := false
+	if w, ok := storageApi.(WarmOffloadCapable); ok {
+		warmOffload = w.SupportsWarmOffload()
+	}
+
+	diskType, err := detectDiskType(ctx, vsphereClient, vmId, vmdkPath, warmOffload)
 	if err != nil {
 		klog.Warningf("Failed to detect disk type: %v, using VMDK/Xcopy", err)
 		return createVMDKPopulator(storageApi, vsphereClient, sshConfig)

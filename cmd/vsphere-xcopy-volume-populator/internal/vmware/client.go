@@ -3,10 +3,9 @@ package vmware
 import (
 	"context"
 	"encoding/xml"
+	"fmt"
 	"net/url"
 	"strings"
-
-	"fmt"
 
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/cli/esx"
@@ -24,8 +23,11 @@ type Client interface {
 	GetEsxByVm(ctx context.Context, vmName string) (*object.HostSystem, error)
 	RunEsxCommand(ctx context.Context, host *object.HostSystem, command []string) ([]esx.Values, error)
 	GetDatastore(ctx context.Context, dc *object.Datacenter, datastore string) (*object.Datastore, error)
-	// GetVMDiskBacking returns disk backing information for detecting disk type (VVol, RDM, VMDK)
-	GetVMDiskBacking(ctx context.Context, vmId string, vmdkPath string) (*DiskBacking, error)
+	// GetVMDiskBacking returns disk backing information for detecting disk type (VVol, RDM, VMDK).
+	// When warmOffload is true, snapshot-aware detection is used: the Parent chain is walked to
+	// match the path and to find the base disk's BackingObjectId, identifying vVol-backed disks
+	// even when a precopy snapshot is active and the top-level backing filename has changed.
+	GetVMDiskBacking(ctx context.Context, vmId string, vmdkPath string, warmOffload bool) (*DiskBacking, error)
 }
 
 // DiskBacking contains information about the disk backing type
@@ -145,7 +147,7 @@ func (c *VSphereClient) GetDatastore(ctx context.Context, dc *object.Datacenter,
 }
 
 // GetVMDiskBacking retrieves disk backing information to determine disk type
-func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkPath string) (*DiskBacking, error) {
+func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkPath string, warmOffload bool) (*DiskBacking, error) {
 	finder := find.NewFinder(c.Client.Client, true)
 	datacenters, err := finder.DatacenterList(ctx, "*")
 	if err != nil {
@@ -193,18 +195,36 @@ func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkP
 		// Check different backing types
 		switch backing := disk.Backing.(type) {
 		case *types.VirtualDiskFlatVer2BackingInfo:
-			// Check if this disk matches the requested path
+			if warmOffload {
+				if !flatBackingMatchesPath(backing, normalizedPath, vmdkPath) {
+					continue
+				}
+				vvolId := findVVolBackingObjectId(backing)
+				if vvolId != "" {
+					klog.V(2).Infof("disk is VVol-backed: vmdk=%s backing_object_id=%s", vmdkPath, vvolId)
+					return &DiskBacking{
+						VVolId:     vvolId,
+						IsRDM:      false,
+						DeviceName: backing.FileName,
+					}, nil
+				}
+				klog.V(2).Infof("disk is VMDK-backed: vmdk=%s", vmdkPath)
+				return &DiskBacking{
+					VVolId:     "",
+					IsRDM:      false,
+					DeviceName: backing.FileName,
+				}, nil
+			}
+
+			// Original path for non-warm-offload vendors
 			if !strings.Contains(strings.ToLower(backing.FileName), normalizedPath) &&
 				!strings.Contains(normalizedPath, strings.ToLower(backing.FileName)) {
 				klog.Infof("backing.FileName: %s, normalizedPath: %s", backing.FileName, normalizedPath)
-				// Try to match by extracting datastore and path
 				if !diskPathMatches(backing.FileName, vmdkPath) {
 					klog.Infof("vmdkpath does not match: %s, %s", backing.FileName, vmdkPath)
 					continue
 				}
 			}
-
-			// Check for VVol backing
 			if backing.BackingObjectId != "" {
 				klog.Infof("Disk %s is VVol-backed (BackingObjectId: %s)", vmdkPath, backing.BackingObjectId)
 				return &DiskBacking{
@@ -213,8 +233,6 @@ func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkP
 					DeviceName: backing.FileName,
 				}, nil
 			}
-
-			// Regular VMDK
 			klog.Infof("Disk %s is VMDK-backed", vmdkPath)
 			return &DiskBacking{
 				VVolId:     "",
@@ -247,6 +265,36 @@ func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkP
 		IsRDM:      false,
 		DeviceName: "",
 	}, nil
+}
+
+// flatBackingMatchesPath reports whether vmdkPath matches the supplied flat
+// backing or any backing in its Parent chain. Walking the chain is required
+// when a snapshot is active because the snapshot backing at the top of the
+// chain has a different filename than the originally-requested base path;
+// for non-snapshotted disks Parent is nil and the loop runs once.
+func flatBackingMatchesPath(b *types.VirtualDiskFlatVer2BackingInfo, normalizedPath, vmdkPath string) bool {
+	for cur := b; cur != nil; cur = cur.Parent {
+		fn := strings.ToLower(cur.FileName)
+		if strings.Contains(fn, normalizedPath) ||
+			strings.Contains(normalizedPath, fn) ||
+			diskPathMatches(cur.FileName, vmdkPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// findVVolBackingObjectId returns the first non-empty BackingObjectId found
+// while walking the supplied flat backing's Parent chain, or "" if none is
+// present. Walking is required because snapshot backings carry an empty
+// BackingObjectId even when the underlying base disk is vVol-backed.
+func findVVolBackingObjectId(b *types.VirtualDiskFlatVer2BackingInfo) string {
+	for cur := b; cur != nil; cur = cur.Parent {
+		if cur.BackingObjectId != "" {
+			return cur.BackingObjectId
+		}
+	}
+	return ""
 }
 
 // diskPathMatches compares two VMDK paths accounting for different formats

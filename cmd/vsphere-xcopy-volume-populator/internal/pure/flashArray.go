@@ -24,6 +24,11 @@ const FlashProviderID = "624a9370"
 var _ populator.RDMCapable = &FlashArrayClonner{}
 var _ populator.VVolCapable = &FlashArrayClonner{}
 var _ populator.VMDKCapable = &FlashArrayClonner{}
+var _ populator.WarmOffloadCapable = &FlashArrayClonner{}
+
+func (f *FlashArrayClonner) SupportsWarmOffload() bool {
+	return true
+}
 
 type FlashArrayClonner struct {
 	restClient    *RestClient
@@ -274,7 +279,7 @@ func (f *FlashArrayClonner) RDMCopy(vsphereClient vmware.Client, vmId string, so
 	klog.Infof("Pure RDM Copy: Starting RDM copy operation for VM %s", vmId)
 
 	// Get disk backing info to find the RDM device
-	backing, err := vsphereClient.GetVMDiskBacking(context.Background(), vmId, sourceVMDKFile)
+	backing, err := vsphereClient.GetVMDiskBacking(context.Background(), vmId, sourceVMDKFile, false)
 	if err != nil {
 		return fmt.Errorf("failed to get RDM disk backing info: %w", err)
 	}
