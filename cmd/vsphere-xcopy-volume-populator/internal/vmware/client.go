@@ -196,13 +196,18 @@ func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkP
 			// vSphere adds a child disk (foo-000001.vmdk) on top of the original
 			// (foo.vmdk). vmdkPath is the base path, so the match lives at the parent
 			// level, not the top.
+			klog.V(2).Infof("Inspecting disk vmdkPath=%q, top backing FileName=%q", vmdkPath, backing.FileName)
 			matched := findMatchingFlatBacking(backing, normalizedPath, vmdkPath)
 			if matched == nil {
 				continue
 			}
 
 			if matched.BackingObjectId != "" {
-				klog.V(2).Infof("Disk %s is VVol-backed (BackingObjectId: %s)", vmdkPath, backing.BackingObjectId)
+				if matched.BackingObjectId != backing.BackingObjectId {
+					klog.V(2).Infof("Disk %s matched at parent in chain — VVol-backed, warm precopy (BackingObjectId %s)", vmdkPath, matched.BackingObjectId)
+				} else {
+					klog.V(2).Infof("Disk %s matched at top of chain — VVol-backed (BackingObjectId %s)", vmdkPath, matched.BackingObjectId)
+				}
 				return &DiskBacking{
 					VVolId:     matched.BackingObjectId,
 					IsRDM:      false,
@@ -220,7 +225,7 @@ func (c *VSphereClient) GetVMDiskBacking(ctx context.Context, vmId string, vmdkP
 			// Check if this disk matches
 			if !strings.Contains(strings.ToLower(backing.FileName), normalizedPath) &&
 				!strings.Contains(normalizedPath, strings.ToLower(backing.FileName)) {
-				if !diskPathMatches(backing.FileName, vmdkPath) {
+				if !DiskPathMatches(backing.FileName, vmdkPath) {
 					continue
 				}
 			}
@@ -255,15 +260,16 @@ func findMatchingFlatBacking(b *types.VirtualDiskFlatVer2BackingInfo, normalized
 		fn := strings.ToLower(cur.FileName)
 		if strings.Contains(fn, normalizedPath) ||
 			strings.Contains(normalizedPath, fn) ||
-			diskPathMatches(cur.FileName, vmdkPath) {
+			DiskPathMatches(cur.FileName, vmdkPath) {
 			return cur
 		}
 	}
 	return nil
 }
 
-// diskPathMatches compares two VMDK paths accounting for different formats
-func diskPathMatches(path1, path2 string) bool {
+// DiskPathMatches compares two VMDK paths accounting for different formats
+// (case, surrounding whitespace, and the "[datastore] ..." brackets).
+func DiskPathMatches(path1, path2 string) bool {
 	// Extract datastore and filename from both paths
 	// Format: "[datastore] folder/file.vmdk"
 	normalize := func(p string) string {

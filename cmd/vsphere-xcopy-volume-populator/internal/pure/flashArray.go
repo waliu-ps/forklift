@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"slices"
 	"strings"
 
@@ -272,19 +271,14 @@ func (f *FlashArrayClonner) getSourceVolume(vsphereClient vmware.Client, vmId st
 // child -> base vVol (current writes), parent -> snap-vVol (frozen). The
 // caller's vmdkPath picks which level matches.
 func (f *FlashArrayClonner) findMatchingFlatBacking(b *types.VirtualDiskFlatVer2BackingInfo, vmDisk populator.VMDisk) *types.VirtualDiskFlatVer2BackingInfo {
+	// ParseVmdkPath splits the source into Datastore/VmHomeDir/VmdkFile
+	fullPath := fmt.Sprintf("[%s] %s/%s", vmDisk.Datastore, vmDisk.VmHomeDir, vmDisk.VmdkFile)
 	for cur := b; cur != nil; cur = cur.Parent {
-		if f.matchesVMDKPath(cur.FileName, vmDisk) {
+		if vmware.DiskPathMatches(cur.FileName, fullPath) {
 			return cur
 		}
 	}
 	return nil
-}
-
-// matchesVMDKPath checks if a vSphere VVol filename matches the target VMDK
-func (f *FlashArrayClonner) matchesVMDKPath(fileName string, vmDisk populator.VMDisk) bool {
-	fileBase := filepath.Base(fileName)
-	targetBase := filepath.Base(vmDisk.VmdkFile)
-	return fileBase == targetBase
 }
 
 // RDMCopy performs a copy operation for RDM-backed disks using Pure FlashArray APIs
